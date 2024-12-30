@@ -1,5 +1,5 @@
-;; ShowPass - Decentralized Event Ticketing System
-;; Description: Smart contract for minting and managing NFT event tickets with transfer restrictions and refund policies
+;; ShowPass - Decentralized Event Ticketing System with Refund Insurance
+;; Description: Smart contract for minting and managing NFT event passes with transfer restrictions and refund insurance
 
 ;; Constants
 (define-constant admin tx-sender)
@@ -9,10 +9,17 @@
 (define-constant ERR-NO-TRANSFERS (err u103))
 (define-constant ERR-SHOW-ONGOING (err u104))
 (define-constant ERR-REFUND-INVALID (err u105))
+(define-constant ERR-INSURANCE-USED (err u106))
+(define-constant ERR-BAD-PARAMS (err u107))
+(define-constant INSURANCE-RATE u5) ;; 5% of pass price
+(define-constant INSURANCE-VAULT 'SP000000000000000000002Q6VF78) ;; Example vault address
+(define-constant MIN-FEE u1000) ;; Minimum admission fee
+(define-constant MAX-CAPACITY u10000) ;; Maximum passes per show
 
 ;; Data Variables
 (define-data-var next-show-id uint u1)
 (define-data-var next-pass-id uint u1)
+(define-data-var insurance-vault uint u0)
 
 ;; Data Maps
 (define-map Shows
@@ -37,6 +44,8 @@
         is-scanned: bool,
         resold: bool,
         ticket-cost: uint,
+        has-protection: bool,
+        protection-used: bool,
         seat-info: (string-ascii 256)
     }
 )
@@ -53,6 +62,36 @@
     )
 )
 
+(define-private (calculate-protection-cost (pass-price uint))
+    (/ (* pass-price INSURANCE-RATE) u100)
+)
+
+(define-private (handle-protection-purchase (protection-cost uint) (host principal))
+    (if (> protection-cost u0)
+        (begin
+            (try! (stx-transfer? protection-cost host INSURANCE-VAULT))
+            (var-set insurance-vault (+ (var-get insurance-vault) protection-cost))
+            (ok true)
+        )
+        (ok true)
+    )
+)
+
+(define-private (validate-show-params (title (string-ascii 100)) 
+                                    (max-capacity uint)
+                                    (admission-fee uint)
+                                    (showtime uint)
+                                    (venue-details (string-ascii 256)))
+    (and
+        (> (len title) u0)
+        (<= max-capacity MAX-CAPACITY)
+        (> max-capacity u0)
+        (>= admission-fee MIN-FEE)
+        (> showtime block-height)
+        (> (len venue-details) u0)
+    )
+)
+
 ;; Public Functions
 
 ;; Create a new show
@@ -61,7 +100,12 @@
                           (admission-fee uint)
                           (showtime uint)
                           (venue-details (string-ascii 256)))
-    (let ((show-id (var-get next-show-id)))
+    (let (
+        (show-id (var-get next-show-id))
+        (params-valid (validate-show-params title max-capacity admission-fee showtime venue-details))
+    )
+        (asserts! params-valid ERR-BAD-PARAMS)
+        
         (map-set Shows
             show-id
             {
@@ -80,17 +124,25 @@
     )
 )
 
-;; Purchase a pass
-(define-public (buy-pass (show-id uint))
+;; Purchase a pass with optional protection
+(define-public (buy-pass (show-id uint) (with-protection bool))
     (let (
         (show (unwrap! (map-get? Shows show-id) ERR-SHOW-NOT-FOUND))
         (pass-id (var-get next-pass-id))
+        (protection-cost (if with-protection 
+                           (calculate-protection-cost (get admission-fee show))
+                           u0))
+        (total-cost (+ (get admission-fee show) protection-cost))
     )
         (asserts! (< (get seats-taken show) (get max-capacity show)) ERR-NO-SEATS)
         (asserts! (not (get is-terminated show)) ERR-SHOW-ONGOING)
+        (asserts! (< block-height (get showtime show)) ERR-BAD-PARAMS)
         
         ;; Process payment
-        (try! (stx-transfer? (get admission-fee show) tx-sender (get host show)))
+        (try! (stx-transfer? total-cost tx-sender (get host show)))
+        
+        ;; Handle protection purchase
+        (try! (handle-protection-purchase protection-cost (get host show)))
         
         ;; Mint pass
         (map-set Passes
@@ -101,6 +153,8 @@
                 is-scanned: false,
                 resold: false,
                 ticket-cost: (get admission-fee show),
+                has-protection: with-protection,
+                protection-used: false,
                 seat-info: (get venue-details show)
             }
         )
@@ -177,6 +231,32 @@
     )
 )
 
+;; Claim protection refund (can be used even if show is not canceled)
+(define-public (claim-protection-refund (pass-id uint))
+    (let (
+        (pass (unwrap! (map-get? Passes pass-id) ERR-SHOW-NOT-FOUND))
+    )
+        (asserts! (is-eq (get holder pass) tx-sender) ERR-UNAUTHORIZED)
+        (asserts! (get has-protection pass) ERR-REFUND-INVALID)
+        (asserts! (not (get protection-used pass)) ERR-INSURANCE-USED)
+        
+        ;; Process protection refund
+        (try! (stx-transfer? (get ticket-cost pass) 
+                           INSURANCE-VAULT 
+                           tx-sender))
+        
+        ;; Mark protection as used
+        (map-set Passes
+            pass-id
+            (merge pass { 
+                protection-used: true,
+                is-scanned: true 
+            })
+        )
+        (ok true)
+    )
+)
+
 ;; Validate pass
 (define-public (scan-pass (pass-id uint))
     (let ((pass (unwrap! (map-get? Passes pass-id) ERR-SHOW-NOT-FOUND)))
@@ -203,4 +283,12 @@
 
 (define-read-only (get-show-passes (show-id uint))
     (map-get? ShowPasses show-id)
+)
+
+(define-read-only (get-protection-cost (pass-price uint))
+    (calculate-protection-cost pass-price)
+)
+
+(define-read-only (get-protection-vault-balance)
+    (var-get insurance-vault)
 )
